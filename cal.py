@@ -6,9 +6,11 @@ import time
 import concurrent.futures
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from dotenv import load_dotenv
 
+load_dotenv()
 # --- Configuration ---
-TEMPO_BASE_URL = "XXXXXX:3200"
+TEMPO_BASE_URL = os.getenv("TEMPO_BASE_URL")
 TRACEQL_QUERY = '{ .service.name = "credential-verifier-api" }'
 
 START_TIME_STR = "2026-04-19 01:30:38"

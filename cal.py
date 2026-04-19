@@ -7,7 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import re
 import os
-
+import random
 # --- Configuration ---
 TEMPO_BASE_URL = "XXXXXX:3200"
 JMETER_GRAPH_FILE = "graph.js"
@@ -85,27 +85,51 @@ def extract_windows_per_test(graph_js_path):
 
 def get_all_trace_ids(start_ts, end_ts, query, chunk_secs):
     all_trace_ids = set()
-    current_ts = start_ts
+    PAGE_LIMIT = 300
 
-    while current_ts < end_ts:
-        next_ts = min(current_ts + chunk_secs, end_ts)
+    # Create a queue of time windows to process
+    windows_to_process = []
+    current = start_ts
+    while current < end_ts:
+        windows_to_process.append((int(current), int(min(current + chunk_secs, end_ts))))
+        current += chunk_secs
+
+    while windows_to_process:
+        # Take the next time window from the queue
+        win_start, win_end = windows_to_process.pop(0)
+
+        # Safety catch: if the window is somehow 0 seconds, skip it
+        if win_start >= win_end:
+            continue
+
         url = f"{TEMPO_BASE_URL}/api/search"
-
-        # Pass pure Unix Timestamps to avoid all Timezone bugs
         params = {
             "q": query,
-            "start": int(current_ts),
-            "end": int(next_ts),
-            "limit": 5000
+            "start": win_start,
+            "end": win_end,
+            "limit": PAGE_LIMIT
         }
+
         try:
             response = session.get(url, params=params)
             if response.status_code == 200:
-                chunk_ids = [trace['traceID'] for trace in response.json().get('traces', [])]
-                all_trace_ids.update(chunk_ids)
+                traces = response.json().get('traces', [])
+
+                for trace in traces:
+                    all_trace_ids.add(trace['traceID'])
+
+                # --- BISECTION PAGINATION LOGIC ---
+                # If we hit the 300 limit, there are traces hiding in this window!
+                # We split the time window perfectly in half and queue both halves.
+                if len(traces) == PAGE_LIMIT and (win_end - win_start) > 1:
+                    mid_point = win_start + ((win_end - win_start) // 2)
+
+                    # Insert the two smaller halves at the front of the queue
+                    windows_to_process.insert(0, (win_start, mid_point))
+                    windows_to_process.insert(1, (mid_point, win_end))
+
         except Exception:
             pass
-        current_ts = next_ts
 
     return list(all_trace_ids)
 
@@ -266,14 +290,22 @@ if __name__ == "__main__":
             print(f"  -> Giving up. No traces found in Tempo within this test's isolated fence.\n")
             continue
 
-        print(f"  -> Found {len(trace_ids)} total traces! Fetching sub-spans concurrently in batches...")
+            # Convert to list to prepare for sampling
+        trace_ids_list = list(trace_ids)
+
+        # --- 5% SAMPLING LOGIC ---
+        # Calculate 5% of the total traces (using max to ensure we get at least 1 if the list is very small)
+        sample_size = max(1, int(len(trace_ids_list) * 0.3))
+        trace_ids_list = random.sample(trace_ids_list, sample_size)
+
+        print(f"  -> Found {len(trace_ids)} total traces! Sampled {len(trace_ids_list)} (~100%) for processing...")
 
         global_durations = defaultdict(list)
         stats = {"success": 0, "not_found_404": 0, "server_error": 0}
 
         # --- BATCHING FIX (Prevents Exit Code 137 / OOM Crash) ---
-        trace_ids_list = list(trace_ids)
-        BATCH_SIZE = 500
+        # The batching will now only process the 25% sample
+        BATCH_SIZE = 10
 
         for i in range(0, len(trace_ids_list), BATCH_SIZE):
             batch_ids = trace_ids_list[i:i + BATCH_SIZE]

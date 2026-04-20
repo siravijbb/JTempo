@@ -1,17 +1,17 @@
 import requests
 import numpy as np
 from collections import defaultdict
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timezone
 import concurrent.futures
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from dotenv import load_dotenv
-
-load_dotenv()
-# --- Configuration ---
+import re
+import os
+import random
+import time
 TEMPO_BASE_URL = os.getenv("TEMPO_BASE_URL")
-TRACEQL_QUERY = '{ .service.name = "credential-verifier-api" }'
+# --- Configuration ---
+JMETER_GRAPH_FILE = "graph.js"
 
 CHUNK_SECONDS = 15
 MAX_WORKERS = 8
@@ -50,7 +50,7 @@ def extract_windows_per_test(graph_js_path):
                              'success'] or "-success" in label.lower() or "-aggregated" in label.lower():
             continue
 
-        # Using TIME_SHIFT_SECONDS = 0 as you requested
+        # Using TIME_SHIFT_SECONDS = 0 as requested
         x_vals = [(float(pt.group(1)) / 1000.0) + TIME_SHIFT_SECONDS for pt in
                   re.finditer(r'\[([\d\.E+-]+)\s*,', data_str) if float(pt.group(1)) > 1e11]
         if not x_vals: continue
@@ -210,7 +210,7 @@ def find_true_end_via_void(start_ts, rough_end_ts, query, chunk_secs=5, void_thr
     current_ts = scan_start
     last_active_ts = rough_end_ts
     consecutive_empty = 0
-    seen_active = False  # <-- ADD THIS
+    seen_active = False
 
     while current_ts < scan_end:
         next_ts = current_ts + chunk_secs
@@ -228,13 +228,14 @@ def find_true_end_via_void(start_ts, rough_end_ts, query, chunk_secs=5, void_thr
                 if count > 0:
                     last_active_ts = next_ts
                     consecutive_empty = 0
-                    seen_active = True  # <-- ADD THIS
+                    seen_active = True
                 else:
-                    if seen_active:  # <-- ONLY COUNT VOID AFTER SEEING DATA
+                    if seen_active:
                         consecutive_empty += 1
                         if consecutive_empty >= void_threshold_chunks:
                             true_end = last_active_ts
-                            print(f"     [void detected] Last active: {datetime.fromtimestamp(last_active_ts).strftime('%H:%M:%S')} | Void confirmed at: {datetime.fromtimestamp(current_ts).strftime('%H:%M:%S')}")
+                            print(
+                                f"     [void detected] Last active: {datetime.fromtimestamp(last_active_ts).strftime('%H:%M:%S')} | Void confirmed at: {datetime.fromtimestamp(current_ts).strftime('%H:%M:%S')}")
                             return true_end
         except Exception:
             pass
@@ -279,41 +280,61 @@ if __name__ == "__main__":
             start_ts=window['actual_start'],
             rough_end_ts=window['actual_end'],
             query=current_query,
-            chunk_secs=5,            # 5s resolution is fine
+            chunk_secs=5,  # 5s resolution is fine
             void_threshold_chunks=3  # 15s of silence = confirmed void
         )
         fence_start = window['actual_start'] - 2
         fence_end = true_end
-        print(f"  -> Pass 2: Fetching all traces in true window {datetime.fromtimestamp(fence_start).strftime('%H:%M:%S')} → {datetime.fromtimestamp(fence_end).strftime('%H:%M:%S')}")
+        print(
+            f"  -> Pass 2: Fetching all traces in true window {datetime.fromtimestamp(fence_start).strftime('%H:%M:%S')} → {datetime.fromtimestamp(fence_end).strftime('%H:%M:%S')}")
         trace_ids = set(get_all_trace_ids(fence_start, fence_end, current_query, CHUNK_SECONDS))
 
         if not trace_ids:
             print(f"  -> Giving up. No traces found in Tempo within this test's isolated fence.\n")
             continue
 
-            # Convert to list to prepare for sampling
+        # Convert to list to prepare for sampling
         trace_ids_list = list(trace_ids)
 
-        # --- 5% SAMPLING LOGIC ---
-        # Calculate 5% of the total traces (using max to ensure we get at least 1 if the list is very small)
-        sample_size = max(1, int(len(trace_ids_list) * 0.3))
+        # --- SAMPLING LOGIC ---
+        sample_size = max(1, int(len(trace_ids_list) * 1))  # Currently set to 100% via * 1
         trace_ids_list = random.sample(trace_ids_list, sample_size)
 
-        print(f"  -> Found {len(trace_ids)} total traces! Sampled {len(trace_ids_list)} (~100%) for processing...")
+        print(f"  -> Found {len(trace_ids)} total traces! Sampled {len(trace_ids_list)} for processing...")
 
         global_durations = defaultdict(list)
         stats = {"success": 0, "not_found_404": 0, "server_error": 0}
 
-        # --- BATCHING FIX (Prevents Exit Code 137 / OOM Crash) ---
-        # The batching will now only process the 25% sample
-        BATCH_SIZE = 10
+        # --- BATCHING WITH ETA ---
+        BATCH_SIZE = 500
+
+        # Start the stopwatch for ETA calculation
+        batch_start_time = time.time()
 
         for i in range(0, len(trace_ids_list), BATCH_SIZE):
             batch_ids = trace_ids_list[i:i + BATCH_SIZE]
             current_batch = (i // BATCH_SIZE) + 1
-            total_batches = (len(trace_ids_list) // BATCH_SIZE) + 1
+            # Handle total_batches rounding cleanly
+            total_batches = (len(trace_ids_list) + BATCH_SIZE - 1) // BATCH_SIZE
 
-            print(f"     Processing batch {current_batch} of {total_batches}...")
+            # --- ETA LOGIC ---
+            if current_batch == 1:
+                eta_str = "Calculating..."
+            else:
+                elapsed_time = time.time() - batch_start_time
+                avg_time_per_batch = elapsed_time / (current_batch - 1)
+                batches_left = total_batches - current_batch + 1
+                eta_seconds = int(avg_time_per_batch * batches_left)
+
+                # Format cleanly into Hours, Minutes, and Seconds
+                mins, secs = divmod(eta_seconds, 60)
+                hours, mins = divmod(mins, 60)
+                if hours > 0:
+                    eta_str = f"{hours}h {mins}m {secs}s"
+                else:
+                    eta_str = f"{mins}m {secs}s"
+
+            print(f"     Processing batch {current_batch} of {total_batches}... (ETA: {eta_str})")
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_tid = {executor.submit(worker_task, t_id): t_id for t_id in batch_ids}
